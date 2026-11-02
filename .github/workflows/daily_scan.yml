@@ -2,8 +2,8 @@ name: AStockTail daily scan
 
 on:
   schedule:
-    # UTC 06:42 = 北京时间14:42 = 韩国时间15:42
-    - cron: '42 6 * * 1-5'
+    # UTC 06:40 = 北京时间14:40 = 韩国时间15:40
+    - cron: '40 6 * * 1-5'
   workflow_dispatch:
 
 permissions:
