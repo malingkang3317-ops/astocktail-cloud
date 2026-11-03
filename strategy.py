@@ -46,26 +46,57 @@ def num(s):
     return pd.to_numeric(s, errors='coerce')
 
 
-def pref_candidates(ak, observed_at):
-    """Snapshot itself has no exchange timestamp; mark acquisition timestamp separately."""
-    snap = ak.stock_zh_a_spot_em()
+def within(value, low, high):
+    return low <= value <= high
+
+
+def prefilter_snapshot_frame(snap, relaxed=True):
+    """Broad candidate discovery from a SINGLE market snapshot; not final verification."""
     if snap is None or snap.empty:
         raise RuntimeError('A股快照为空')
     needed = ['代码','名称','最新价','涨跌幅','量比','换手率','流通市值']
-    if any(c not in snap.columns for c in needed):
-        raise RuntimeError(f'行情字段缺失: {set(needed)-set(snap.columns)}')
+    missing = set(needed) - set(snap.columns)
+    if missing:
+        raise RuntimeError(f'行情字段缺失: {missing}')
     d = snap.copy()
-    for c in needed[2:]:
-        d[c] = num(d[c])
+    for col in needed[2:]:
+        d[col] = num(d[col])
     d['代码'] = d['代码'].astype(str).str.zfill(6)
-    d = d[d['代码'].str.match(r'^(60|68|00|30)\d{4}$')]
-    d = d[(d['涨跌幅']>=CONFIG['min_change_pct']) & (d['涨跌幅']<=CONFIG['max_change_pct']) &
-          (d['量比']>CONFIG['min_volume_ratio']) &
-          (d['换手率']>=CONFIG['min_turnover_pct']) & (d['换手率']<=CONFIG['max_turnover_pct']) &
-          (d['流通市值']>=CONFIG['min_float_market_cap_yuan']) & (d['流通市值']<=CONFIG['max_float_market_cap_yuan'])]
+    d = d[d['代码'].str.fullmatch(r'(60|68|00|30)\d{4}') == True]
+    if relaxed:
+        lo, hi = CONFIG['pre_min_change_pct'], CONFIG['pre_max_change_pct']
+        vr = CONFIG['pre_min_volume_ratio']
+        to_lo, to_hi = CONFIG['pre_min_turnover_pct'], CONFIG['pre_max_turnover_pct']
+        cap_lo, cap_hi = CONFIG['pre_min_float_market_cap_yuan'], CONFIG['pre_max_float_market_cap_yuan']
+    else:
+        lo, hi = CONFIG['min_change_pct'], CONFIG['max_change_pct']
+        vr = CONFIG['min_volume_ratio']
+        to_lo, to_hi = CONFIG['min_turnover_pct'], CONFIG['max_turnover_pct']
+        cap_lo, cap_hi = CONFIG['min_float_market_cap_yuan'], CONFIG['max_float_market_cap_yuan']
+    d = d[d['涨跌幅'].between(lo, hi) & (d['量比'] > vr) &
+          d['换手率'].between(to_lo, to_hi) & d['流通市值'].between(cap_lo, cap_hi)]
     d = d.sort_values(['量比','换手率'], ascending=False)
-    return d.head(CONFIG['max_candidates_to_verify']).to_dict('records'), len(d), observed_at.isoformat(timespec='seconds')
+    return d, len(d)
 
+
+def pref_candidates(ak, observed_at, relaxed=True):
+    """One all-market AKShare fetch. Capture the timestamp AFTER completion."""
+    started = now_cn()
+    snap = ak.stock_zh_a_spot_em()
+    fetched = now_cn()
+    d, total = prefilter_snapshot_frame(snap, relaxed=relaxed)
+    log(f'全市场快照请求耗时={(fetched-started).total_seconds():.1f}s，宽松候选{total}只，采集结束={fetched.isoformat()}')
+    return d.head(CONFIG['max_candidates_to_verify']).to_dict('records'), total, fetched.isoformat(timespec='seconds')
+
+
+def baseline_check(stock):
+    """Check the original snapshot values, do NOT label them final 14:50 values."""
+    return bool(
+        within(float(stock['涨跌幅']), CONFIG['min_change_pct'], CONFIG['max_change_pct']) and
+        float(stock['量比']) > CONFIG['min_volume_ratio'] and
+        within(float(stock['换手率']), CONFIG['min_turnover_pct'], CONFIG['max_turnover_pct']) and
+        within(float(stock['流通市值']), CONFIG['min_float_market_cap_yuan'], CONFIG['max_float_market_cap_yuan'])
+    )
 
 def bars_asof(df, day, cut):
     if df is None or df.empty or '时间' not in df:
@@ -203,73 +234,113 @@ def save(result):
     notify(result)
 
 
+def _minute_stock(ak, code, day, cutoff):
+    return ak.stock_zh_a_hist_min_em(symbol=code,period='1',
+            start_date=f'{day} 09:30:00',end_date=f'{day} 14:50:00',adjust='')
+
+
+def _minute_index(ak, code, day):
+    return ak.index_zh_a_hist_min_em(symbol=code,period='1',
+            start_date=f'{day} 09:30:00',end_date=f'{day} 14:50:00')
+
+
 def run(manual=False):
     ak=get_ak()
     today=now_cn().date()
     if not trading_day(ak,today):
-        log('沪深休市，直接结束；不发送选股通知')
+        log('沪深休市，不发选股通知')
         return
     cutoff=cutoff_for(today)
-    result={'date':str(today),'cutoff':cutoff.isoformat(),'generated_at':now_cn().isoformat(),
+    result={'date':str(today),'cutoff':cutoff.isoformat(), 'generated_at':now_cn().isoformat(),
             'status':'not_verified','message':'','selected':[],'verified':[], 'rejections':[],
-            'definitions':{'量比':'快照接口字段量比，约为截至取数时点每分钟成交量与过去5日同期均量之比；源接口未提供精确交易所时间戳',
-                          '均价线':'累计成交额 / (累计成交量（手）×100)；需确认源成交量单位为手',
-                          '价格快照时间':'仅记录HTTP数据获取时刻，无法证明交易所源数据毫秒级实时'}}
+            'preselected':[], 'definitions':{
+              '量比':'初筛AKShare快照字段；无逐股交易所时间戳，不能证明14:50量比',
+              '均价线':'累计成交额/（累计成交量（手）×100），必须确认数据源单位',
+              '实时性':'14:50分钟线仅为分钟价量，不能替代14:50量比及换手率的独立核验'}}
     try:
-        # Only execute at a bounded valid decision window. Never run late and call it 14:50.
-        start=cutoff-timedelta(minutes=8)
+        start=cutoff-timedelta(minutes=20)
         if not manual:
             if now_cn()<start:
-                wait=(start-now_cn()).total_seconds()
-                if wait>300: raise RuntimeError('任务启动过早，拒绝长时间等待')
-                time.sleep(max(0,wait))
-            if now_cn()>cutoff+timedelta(minutes=CONFIG['max_run_lateness_minutes']):
-                raise RuntimeError('工作流启动过晚，无法声称14:50实时选股')
-        log('交易日确认；拉取预筛快照')
-        pref, total, acquired=pref_candidates(ak, now_cn())
-        log(f'快照通过基础条件 {total} 只；可验证前 {len(pref)} 只')
-        # Need latest snapshot at cutoff. This process is often NOT fast enough: fail closed.
-        if not manual and now_cn()<cutoff:
-            time.sleep((cutoff-now_cn()).total_seconds())
-        snap_time=now_cn()
-        if snap_time>cutoff+timedelta(minutes=CONFIG['max_run_lateness_minutes']):
-            raise RuntimeError('14:50最终验证窗口已错过（快照查询超时）')
-        final, final_total, _=pref_candidates(ak,snap_time)
-        chosen_codes={x['代码'] for x in pref} | {x['代码'] for x in final}
-        final=[x for x in final if x['代码'] in chosen_codes]
-        # Snapshot has no per-stock exchange timestamp: it is an explicit provenance limitation.
-        result['snapshot_captured_at']=snap_time.isoformat(timespec='seconds')
-        cache={}
-        for stock in final:
-            if len(result['selected'])>=3: break
-            code=stock['代码']; idx_code=index_code(code)
-            if now_cn()>cutoff+timedelta(minutes=CONFIG['max_run_lateness_minutes']):
-                result['rejections'].append({'代码':code,'原因':'超出行情时效窗口，停止验证'})
+                delay=(start-now_cn()).total_seconds()
+                if delay>CONFIG['max_wait_before_start_minutes']*60:
+                    raise RuntimeError('任务启动过早，超出等待上限')
+                time.sleep(max(0,delay))
+            if now_cn()>cutoff-timedelta(minutes=CONFIG['minimum_preparation_minutes']):
+                raise RuntimeError('启动时间过晚，无法完成预筛和候选跟踪')
+        log('交易日确认，获取唯一一次全市场快照并宽松预筛')
+        pref,total,acquired=pref_candidates(ak,now_cn(),relaxed=True)
+        result['prefilter_captured_at']=acquired
+        result['prefilter_count']=total
+        result['preselected']=[{'代码':x['代码'],'名称':x['名称']} for x in pref]
+        if not pref:
+            result['status']='no_prefilter_candidates'
+            result['message']='本次全市场快照宽松预筛无候选；此结果不是14:50全市场严格筛选证明'
+            return
+        # IMPORTANT: never make a second whole-market request. Warm candidate/index data instead.
+        idx_cache={}
+        now=now_cn()
+        if not manual and now<cutoff-timedelta(minutes=5):
+            wait=(cutoff-timedelta(minutes=5)-now).total_seconds()
+            log(f'等待至14:45进行候选分钟线预取：{wait:.0f}s')
+            time.sleep(max(0,wait))
+        if not manual and now_cn()>cutoff+timedelta(seconds=CONFIG['final_bar_grace_seconds']):
+            raise RuntimeError('预取前已超出最终验证窗口')
+        # fetch index once per symbol; prefetch stock bars only for a bounded subset.
+        subset=pref[:CONFIG['max_candidate_refresh_count']]
+        for stock in subset:
+            if not manual and now_cn()>cutoff+timedelta(seconds=CONFIG['final_bar_grace_seconds']):
                 break
+            code=stock['代码']; idx=index_code(code)
             try:
-                stock['采集时间']=snap_time.isoformat(timespec='seconds')
-                if idx_code not in cache:
-                    cache[idx_code]=ak.index_zh_a_hist_min_em(symbol=idx_code,period='1',
-                         start_date=f'{today} 09:30:00', end_date=f'{today} 14:50:00')
-                raw=ak.stock_zh_a_hist_min_em(symbol=code,period='1',
-                         start_date=f'{today} 09:30:00', end_date=f'{today} 14:50:00',adjust='')
-                detail=evaluate(stock,raw,cache[idx_code],today,cutoff)
+                if idx not in idx_cache:
+                    idx_cache[idx]=_minute_index(ak,idx,today)
+                # prefetch is an early API connectivity check, not the final 14:50 bars
+                _minute_stock(ak,code,today,cutoff)
+            except Exception as exc:
+                log(f'候选预取失败 {code}: {exc}')
+        if not manual and now_cn()<cutoff:
+            time.sleep(max(0,(cutoff-now_cn()).total_seconds()))
+        if not manual and now_cn()>cutoff+timedelta(seconds=CONFIG['final_bar_grace_seconds']):
+            raise RuntimeError('14:50复核窗口已错过；未取得足够及时的分钟行情')
+        # Fetch latest 1-minute bars of candidates, BUT strict base fields are not reverified.
+        # Thus result['selected'] must remain empty unless a future authenticated per-stock
+        # final snapshot implementation can verify price/change/ratio/turnover/cap at cutoff.
+        for stock in subset:
+            code=stock['代码']
+            if not manual and now_cn()>cutoff+timedelta(seconds=CONFIG['final_bar_grace_seconds']):
+                result['rejections'].append({'代码':code,'原因':'超过分钟线补齐等待上限'})
+                continue
+            try:
+                idx=index_code(code)
+                stock['采集时间']=acquired
+                bars=_minute_stock(ak,code,today,cutoff)
+                if idx not in idx_cache:
+                    idx_cache[idx]=_minute_index(ak,idx,today)
+                detail=evaluate(stock,bars,idx_cache[idx],today,cutoff)
+                detail['初筛快照基础条件']=baseline_check(stock)
+                detail['14:50基础指标已独立复核']=False
+                detail['完全符合']=False
+                detail['分钟技术形态通过']=all(detail['规则验证'].values())
+                detail['验证说明']='分钟技术形态已评估；14:50量比、换手率、流通市值没有可靠逐股终值，不能声称8项严格全部通过'
                 result['verified'].append(detail)
-                if detail['完全符合']:
-                    result['selected'].append(detail)
+                if detail['分钟技术形态通过'] and detail['初筛快照基础条件']:
+                    result['rejections'].append({'代码':code,'原因':'分时技术条件通过，但14:50基础行情字段未独立验证；仅供观察'})
                 else:
-                    result['rejections'].append({'代码':code,'原因':str([k for k,v in detail['规则验证'].items() if not v])})
+                    failed=[k for k,v in detail['规则验证'].items() if not v]
+                    result['rejections'].append({'代码':code,'原因':'未通过:'+','.join(failed) if failed else '初筛快照基础条件与严格条件不同'})
             except Exception as exc:
                 result['rejections'].append({'代码':code,'原因':str(exc)})
-        result['status']='verified' if result['selected'] else 'no_match_or_unverified'
-        result['message']=f"基础条件{final_total}只，完整验证{len(result['verified'])}只；源无交易所逐股快照时间戳，非严格交易所实时证明。"
-        result['generated_at']=now_cn().isoformat()
+        result['status']='partial_verified' if result['verified'] else 'data_unavailable'
+        result['message']=(f'唯一全市场快照预筛{total}只；候选复核{len(result["verified"])}只。'
+          '由于免费接口缺少可核实的14:50逐股量比/换手率等数据，严格符合0只，不能把技术形态通过等同于8项全部通过。'
+          '本方案为效率优先的候选池跟踪，不能保证14:30以后新达标股票均被纳入。')
     except Exception as exc:
         result['status']='data_unavailable'
         result['message']=str(exc)
-        result['generated_at']=now_cn().isoformat()
         log(traceback.format_exc())
-    save(result)
+    finally:
+        result['generated_at']=now_cn().isoformat()
+        save(result)
 
 
 if __name__=='__main__':

@@ -25,7 +25,7 @@ choices={r['date']:r for r in records}
 day=st.selectbox('交易日',list(choices))
 r=choices[day]
 status_cn={'verified':'已验证部分候选','no_match_or_unverified':'无完全通过项 / 部分数据未验证',
-           'data_unavailable':'数据或时效不足','closed':'休市','not_verified':'尚未完成验证'}
+           'data_unavailable':'数据或时效不足','closed':'休市','not_verified':'尚未完成验证','partial_verified':'分钟技术验证完成（基础指标未最终复核）','no_prefilter_candidates':'宽松预筛无候选'}
 c1,c2,c3,c4=st.columns(4)
 c1.metric('目标输出','最多3只')
 c2.metric('严格入选',str(len(r.get('selected',[])))+'只')
@@ -34,6 +34,7 @@ c4.metric('任务状态',status_cn.get(r.get('status'),r.get('status')))
 st.info('行情截止目标：'+r.get('cutoff','—')+'  ｜  运行记录：'+r.get('generated_at','—'))
 st.warning('公开免费行情快照通常不包含交易所逐股时间戳。系统记录的是抓取时间，不能当作交易所实时性保证。GitHub Actions 也不能保证准点启动。')
 st.subheader('完全符合的股票')
+st.caption('注意：14:50基础指标缺少独立实时复核时，严格入选必须是0；下方仅展示技术指标评估。')
 selected=r.get('selected',[])
 if selected:
     cols=['代码','名称','最新价','涨跌幅','量比','换手率','流通市值亿元','分钟行情截止','指数','相对指数超额涨幅百分点','均价线上方比例']

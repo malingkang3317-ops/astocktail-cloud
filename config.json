@@ -17,5 +17,16 @@
   "max_pullback_fraction": 0.018,
   "max_final_data_lag_minutes": 3,
   "cutoff": "14:50",
-  "max_run_lateness_minutes": 2
+  "max_run_lateness_minutes": 2,
+  "pre_min_change_pct": 2.0,
+  "pre_max_change_pct": 6.0,
+  "pre_min_volume_ratio": 0.8,
+  "pre_min_turnover_pct": 3.0,
+  "pre_max_turnover_pct": 12.0,
+  "pre_min_float_market_cap_yuan": 4500000000,
+  "pre_max_float_market_cap_yuan": 22000000000,
+  "max_candidate_refresh_count": 12,
+  "minimum_preparation_minutes": 7,
+  "max_wait_before_start_minutes": 22,
+  "final_bar_grace_seconds": 100
 }
